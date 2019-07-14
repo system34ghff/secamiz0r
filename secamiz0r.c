@@ -1,43 +1,105 @@
 
 #include <stdlib.h>
+#include <time.h>
+#include <math.h>
 #include <memory.h>
 #include <frei0r.h>
 #include <gavl/gavl.h>
 
-typedef struct secamiz0r_instance_s {
-    unsigned int width;
-    unsigned int height;
-
-    unsigned int cwidth;
-    unsigned int cheight;
-    
-    double reception;
-    double shift;
-    double noise;
-    
-    gavl_video_frame_t *frame_in;
-    gavl_video_frame_t *frame_out;
-    gavl_video_frame_t *frame_ycbcr;
-    gavl_video_frame_t *frame_map;
-    
-    gavl_video_format_t format_rgba;
-    gavl_video_format_t format_ycbcr;
-    gavl_video_format_t format_map;
-    
-    gavl_video_converter_t *rgba_to_ycbcr;
-    gavl_video_converter_t *ycbcr_to_rgba;
-
-    gavl_video_scaler_t *map_scaler;
-} secamiz0r_instance_t;
+// -----------------------------------------------------------------------------
+// BASICS
 
 #define COLOR_CLAMP(x) ((x) < 0 ? 0 : ((x) > 255 ? 255 : (x)))
 #define FRAND() (rand() / (double)RAND_MAX)
 
-int f0r_init(void) { return 1; }
-void f0r_deinit(void) {}
+typedef struct secamiz0r_instance_s {
+    unsigned int width;
+    unsigned int height;
+    unsigned int cwidth;
+    unsigned int cheight;
+
+    // Parameters set by a user.
+    // All values must be in 0..1 range.
+    double reception; /* how much random fires will be emitted */
+    double shift; /* threshold of fires that will be emitted on horizontal edges */
+    double noise; /* controls amount of chroma noise, screws quality of picture */
+
+    // Input and output frames are in RGBA format.
+    gavl_video_format_t format_rgba;
+    gavl_video_frame_t *frame_in;
+    gavl_video_frame_t *frame_out;
+
+    // This is the Y'CbCr frame we are working on.
+    gavl_video_frame_t *frame_ycbcr;
+    gavl_video_format_t format_ycbcr;
+
+    // We also need a downscaled copy of the Y'CbCr frame
+    // for some kind of `edge detect'.
+    // This is how I solve problems.
+    gavl_video_scaler_t *map_scaler;
+    gavl_video_format_t format_map;
+    gavl_video_frame_t *frame_map;
+    
+    // I think it's obvious.
+    gavl_video_converter_t *rgba_to_ycbcr;
+    gavl_video_converter_t *ycbcr_to_rgba;
+} secamiz0r_instance_t;
+
+void burn(double reception, double shift, double noise, double time,
+          uint8_t *out, int cwidth, int cheight, const uint8_t *map);
+
+// -----------------------------------------------------------------------------
+// 1D NOISE GENERATOR
+
+#define MAX_NOISE_VERTICES 4096
+#define MAX_NOISE_VERTICES_MASK (MAX_NOISE_VERTICES - 1)
+
+double *noise_vertices;
+
+static int noise_init() {
+    noise_vertices = malloc(sizeof(double) * MAX_NOISE_VERTICES);
+    if (!noise_vertices) {
+        return 0;
+    }
+
+    // FIXME: I should use better RNG
+    srand(time(NULL));
+    for (int i = 0; i < MAX_NOISE_VERTICES; i++) {
+        noise_vertices[i] = FRAND();
+    }
+
+    return 1;
+}
+
+static double get_noise(double x, double amp, double scale) {
+    double xs = x * scale;
+    int xf = floor(xs);
+    double t = xs - xf;
+    double ts = t * t * (3 - 2 * t);
+    int xmin = xf & MAX_NOISE_VERTICES_MASK;
+    int xmax = (xmin + 1) & MAX_NOISE_VERTICES_MASK;
+    double y = noise_vertices[xmin] * (1 - ts) + noise_vertices[xmax] * ts;
+    
+    return y * amp;
+}
+
+// -----------------------------------------------------------------------------
+// FREI0R ENTRIES
+
+int f0r_init(void) {
+    if (!noise_init()) {
+        return 0;
+    }
+
+    return 1;
+}
+
+void f0r_deinit(void) {
+    free(noise_vertices);
+}
 
 void f0r_get_plugin_info(f0r_plugin_info_t *info) {
-    info->name = "secamiz0r";
+    info->name = "Secamiz0R";
     info->author = "Valery Khabarov";
     info->plugin_type = F0R_PLUGIN_TYPE_FILTER;
     info->color_model = F0R_COLOR_MODEL_RGBA8888;
@@ -77,37 +139,37 @@ f0r_instance_t f0r_construct(unsigned int width, unsigned int height) {
     inst->shift = 0.30;
     inst->noise = 0.36;
     
-    inst->frame_in = gavl_video_frame_create(NULL);
-    inst->frame_out = gavl_video_frame_create(NULL);
-    inst->frame_in->strides[0] = inst->width * 4;
-    inst->frame_out->strides[0] = inst->width * 4;
-    
     gavl_video_format_t *rgba = &inst->format_rgba;
     rgba->frame_width = rgba->image_width = inst->width;
     rgba->frame_height = rgba->image_height = inst->height;
     rgba->pixel_width = rgba->pixel_height = 1;
     rgba->pixelformat = GAVL_RGBA_32;
     rgba->interlace_mode = GAVL_INTERLACE_NONE;
+
+    inst->frame_in = gavl_video_frame_create(NULL);
+    inst->frame_out = gavl_video_frame_create(NULL);
+    inst->frame_in->strides[0] = inst->width * 4;
+    inst->frame_out->strides[0] = inst->width * 4;
     
     gavl_video_format_t *ycbcr = &inst->format_ycbcr;
     ycbcr->frame_width = ycbcr->image_width = inst->width;
     ycbcr->frame_height = ycbcr->image_height = inst->height;
     ycbcr->pixel_width = ycbcr->pixel_height = 1;
-    ycbcr->pixelformat = GAVL_YUV_410_P;
+    ycbcr->pixelformat = GAVL_YUV_420_P;
     ycbcr->interlace_mode = GAVL_INTERLACE_NONE;
 
-    gavl_video_format_t *map = &inst->format_map;
-    map->frame_width = map->image_width = inst->width / 4;
-    map->frame_height = map->image_height = inst->height / 4;
-    map->pixel_width = map->pixel_height = 1;
-    map->pixelformat = GAVL_YUV_410_P;
-
     inst->frame_ycbcr = gavl_video_frame_create(ycbcr);
+    inst->cwidth = inst->frame_ycbcr->strides[1];
+    inst->cheight = inst->height / 2;
+
+    gavl_video_format_t *map = &inst->format_map;
+    map->frame_width = map->image_width = inst->width / 2;
+    map->frame_height = map->image_height = inst->height / 2;
+    map->pixel_width = map->pixel_height = 1;
+    map->pixelformat = GAVL_YUV_420_P;
+    
     inst->frame_map = gavl_video_frame_create(map);
     
-    inst->cwidth = inst->frame_ycbcr->strides[1];
-    inst->cheight = inst->height / 4;
-
     gavl_video_options_t *options;
 
     // converters from RGBA to YCbCr and vice versa
@@ -185,47 +247,6 @@ void f0r_get_param_value(f0r_instance_t instance,
     }
 }
 
-void burn(double reception, double shift, double noise,
-          uint8_t *out, int cwidth, int cheight, const uint8_t *map)
-{
-    const int len = cwidth * cheight;
-    int fire = -1;
-    int step = 0;
-
-    for (int idx = 4; idx < len; idx++) {
-        double delta;
-
-        if (idx % cwidth == 0) {
-            delta = 0.0;
-        } else {
-            delta = abs(map[idx] - map[idx - 1]) / 256.0;
-        }
-
-        if (FRAND() > reception || shift < delta) {
-            fire = FRAND() * (256 - out[idx]);
-            step = (256 - out[idx]) / 16;
-
-            for (int j = 1; j <= 3; j++) {
-                // tail
-                int diff = 0.25 * j * fire;
-                out[idx - 3 + j] = COLOR_CLAMP(out[idx - 3 + j] + diff);
-            }
-        }
-
-        if (fire <= 0) {
-            continue;
-        }
-
-        out[idx] = COLOR_CLAMP(out[idx] + fire);
-        fire -= step;
-    }
-}
-
-void make_map(secamiz0r_instance_t *inst) {
-    gavl_video_scaler_scale(inst->map_scaler,
-                            inst->frame_ycbcr, inst->frame_map);
-}
-
 void f0r_update(f0r_instance_t instance, double time,
                 const uint32_t *in_frame, uint32_t *out_frame)
 {
@@ -235,18 +256,83 @@ void f0r_update(f0r_instance_t instance, double time,
     gavl_video_convert(inst->rgba_to_ycbcr, inst->frame_in, inst->frame_ycbcr);
     
     double reception = inst->reception * 0.04 + 0.96;
-    double shift = 1.0 - (inst->shift * 0.5 + 0.5);
+    double shift = 1.0 - inst->shift * 0.8;
     double noise = inst->noise;
     
     // create map
     gavl_video_scaler_scale(inst->map_scaler,
                             inst->frame_ycbcr, inst->frame_map);
 
-    burn(reception, shift, noise, inst->frame_ycbcr->planes[1],
+    burn(reception, shift, noise, time, inst->frame_ycbcr->planes[1],
          inst->cwidth, inst->cheight, inst->frame_map->planes[0]);
-    burn(reception, shift, noise, inst->frame_ycbcr->planes[2],
+    burn(reception, shift, noise, time, inst->frame_ycbcr->planes[2],
          inst->cwidth, inst->cheight, inst->frame_map->planes[0]);
     
     inst->frame_out->planes[0] = (uint8_t *)out_frame;
     gavl_video_convert(inst->ycbcr_to_rgba, inst->frame_ycbcr, inst->frame_out);
+}
+
+// -----------------------------------------------------------------------------
+// SECAM FIRE
+
+void burn(double reception, double shift, double noise, double time,
+          uint8_t *out, int cwidth, int cheight, const uint8_t *map)
+{
+    int fire = -1;
+    int step = 0;
+
+    for (int cy = 1; cy < cheight - 1; cy++) {
+        if (cy % 2 == 0) {
+            continue;
+        }
+
+        // Initially this value was starting at 0, but this could make
+        // beginning of a scanline look empty, so I decided to go with -8.
+        // `fx' stands for `fire index', this is the X value where the last
+        // fire was flashed.
+        int fx = -8;
+
+        for (int cx = 0; cx < cwidth; cx++) {
+            int idx = cy * cwidth + cx;
+            double delta = 0.0;
+
+            if (noise) {
+                double n = get_noise(time + idx, 36.0, 0.48) - 18.0;
+                out[idx] = COLOR_CLAMP(out[idx] + n);
+                out[idx + cwidth] = COLOR_CLAMP(out[idx + cwidth] + n);
+            }
+
+            if (cx > 0) {
+                delta = abs(map[idx] - map[idx - 1]) / 256.0;
+            }
+
+            if (FRAND() > reception || delta > shift) {
+                fire = FRAND() * (256 - out[idx]);
+                step = (256 - out[idx]) / 32;
+
+                if (delta > shift) {
+                    // no tail if the fire was caused by `channel shift'
+                    fx = -8;
+                } else {
+                    fx = cx - 1;
+                }
+            }
+
+            // tail
+            if (cx - fx < 6) {
+                out[idx] = COLOR_CLAMP(out[idx] + fire * (0.15 * (cx - fx)));
+                out[idx + cwidth] = COLOR_CLAMP(out[idx + cwidth]
+                                                + fire * (0.15 * (cx - fx)));
+                continue;
+            }
+
+            if (fire <= 0) {
+                continue;
+            }
+
+            out[idx] = COLOR_CLAMP(out[idx] + fire);
+            out[idx + cwidth] = COLOR_CLAMP(out[idx + cwidth] + fire);
+            fire -= step;
+        }
+    }
 }
