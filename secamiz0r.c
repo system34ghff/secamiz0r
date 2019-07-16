@@ -281,10 +281,18 @@ void burn(double reception, double shift, double noise, double time,
     int fire = -1;
     int step = 0;
 
-    for (int cy = 1; cy < cheight - 1; cy++) {
-        if (cy % 2 == 0) {
+    for (int cy = 0; cy < cheight - 1; cy++) {
+        // Work only on even lines
+        if (cy % 2 == 1) {
             continue;
         }
+
+        // Current and lower scanlines
+        uint8_t *dst_cur = &out[cy * cwidth];
+        uint8_t *dst_low = dst_cur + cwidth;
+
+        // Map's scanline
+        const uint8_t *src_map = &map[cy * cwidth];
 
         // Initially this value was starting at 0, but this could make
         // beginning of a scanline look empty, so I decided to go with -8.
@@ -293,23 +301,24 @@ void burn(double reception, double shift, double noise, double time,
         int fx = -8;
 
         for (int cx = 0; cx < cwidth; cx++) {
-            int idx = cy * cwidth + cx;
             double delta = 0.0;
 
             if (noise) {
-                double n = get_noise(time + idx, 36.0, 0.48) - 18.0;
-                out[idx] = COLOR_CLAMP(out[idx] + n);
-                out[idx + cwidth] = COLOR_CLAMP(out[idx + cwidth] + n);
+                double n = get_noise(time + cy * cwidth + cx, 36.0, 0.48) - 18.0;
+                dst_cur[cx] = COLOR_CLAMP(dst_cur[cx] + n);
+                dst_low[cx] = COLOR_CLAMP(dst_low[cx] + n);
             }
 
             if (cx > 0) {
-                delta = abs(map[idx] - map[idx - 1]) / 256.0;
+                int alpha = src_map[cx - 1] * 0.25 + dst_cur[cx] * 0.75;
+                int beta = src_map[cx] * 0.25 + dst_cur[cx + 1] * 0.75;
+                delta = abs(beta - alpha) / 256.0;
             }
 
             if (FRAND() > reception || delta > shift) {
-                fire = FRAND() * (256 - out[idx]);
-                step = (256 - out[idx]) / 32;
-
+                fire = FRAND() * (256 - dst_cur[cx]);
+                step = (256 - dst_cur[cx]) / 32;
+    
                 if (delta > shift) {
                     // no tail if the fire was caused by `channel shift'
                     fx = -8;
@@ -320,9 +329,8 @@ void burn(double reception, double shift, double noise, double time,
 
             // tail
             if (cx - fx < 6) {
-                out[idx] = COLOR_CLAMP(out[idx] + fire * (0.15 * (cx - fx)));
-                out[idx + cwidth] = COLOR_CLAMP(out[idx + cwidth]
-                                                + fire * (0.15 * (cx - fx)));
+                dst_cur[cx] = COLOR_CLAMP(dst_cur[cx] + fire * (0.15 * (cx - fx)));
+                dst_low[cx] = COLOR_CLAMP(dst_low[cx] + fire * (0.15 * (cx - fx)));
                 continue;
             }
 
@@ -330,8 +338,8 @@ void burn(double reception, double shift, double noise, double time,
                 continue;
             }
 
-            out[idx] = COLOR_CLAMP(out[idx] + fire);
-            out[idx + cwidth] = COLOR_CLAMP(out[idx + cwidth] + fire);
+            dst_cur[cx] = COLOR_CLAMP(dst_cur[cx] + fire);
+            dst_low[cx] = COLOR_CLAMP(dst_low[cx] + fire);
             fire -= step;
         }
     }
