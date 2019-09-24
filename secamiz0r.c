@@ -45,13 +45,24 @@ typedef struct secamiz0r_instance_s {
     gavl_video_converter_t *ycbcr_to_rgba;
 } secamiz0r_instance_t;
 
-void burn(double reception, double shift, double noise, double time,
-          uint8_t *out, int cwidth, int cheight, const uint8_t *map);
+#if 0
+void burn(
+    double reception,
+    double shift,
+    double noise,
+    double time,
+    uint8_t *out,
+    uint8_t *neighbour,
+    int cwidth,
+    int cheight,
+    const uint8_t *map
+);
+#endif
 
 // -----------------------------------------------------------------------------
 // 1D NOISE GENERATOR
 
-#define MAX_NOISE_VERTICES 4096
+#define MAX_NOISE_VERTICES 262144
 #define MAX_NOISE_VERTICES_MASK (MAX_NOISE_VERTICES - 1)
 
 double *noise_vertices;
@@ -247,6 +258,88 @@ void f0r_get_param_value(f0r_instance_t instance,
     }
 }
 
+void burn2(
+    int cwidth, int cheight, uint8_t *cb, uint8_t *cr,
+    int width, const uint8_t *luma,
+    double time,
+    double reception, double shift, double noise
+) {
+    for (int cy = 0; cy < cheight - 1; cy++) {
+        // Work only on even lines
+        if (cy % 2 == 1) {
+            continue;
+        }
+
+        int fire = 0;
+        int step = 0;
+
+        uint8_t *dst[2];
+        dst[0] = &cb[cy * cwidth];
+        dst[1] = &cr[cy * cwidth];
+
+        for (int p = 0; p < 2; p++) {
+            int fx = 0;
+
+            for (int cx = 0; cx < cwidth; cx++) {
+                int e = time * 20.0 + cy * cwidth + cx;
+                int ux = cx + cwidth;
+
+                if (noise) {
+                    double n = get_noise(e, 36.0, noise) - 18.0;
+                    dst[p][cx] = COLOR_CLAMP(dst[p][cx] + n);
+                    dst[p][ux] = COLOR_CLAMP(dst[p][ux] + n);
+                }
+
+                double delta = 0.0;
+                if (shift > 0.0 && cx >= 4 && cx <= cwidth - 16) {
+                    int y = cy * 2;
+
+                    int x, p, q, s, t;
+                    double sigma, tau;
+
+                    x = cx * 2 + 4;
+                    p = luma[y * width + x];
+                    q = luma[y * width + x + 1];
+                    s = luma[y * width + x + width];
+                    t = luma[y * width + x + width + 1];
+                    sigma = (p + q + s + t) / 256.0;
+
+                    x = cx * 2 + 6;
+                    p = luma[y * width + x];
+                    q = luma[y * width + x + 1];
+                    s = luma[y * width + x + width];
+                    t = luma[y * width + x + width + 1];
+                    tau = (p + q + s + t) / 256.0;
+
+                    delta = 1.0 - abs(sigma - tau) / 256.0;
+                }
+
+                if (fire >= 16) {
+                    int dx = cx - fx;
+
+                    // tail
+                    if (dx < 6) {
+                        dst[p][cx] = COLOR_CLAMP(dst[p][cx] + 0.15 * dx * fire);
+                        dst[p][ux] = COLOR_CLAMP(dst[p][ux] + 0.15 * dx * fire);
+                        continue;
+                    }
+
+                    dst[p][cx] = COLOR_CLAMP(dst[p][cx] + fire);
+                    dst[p][ux] = COLOR_CLAMP(dst[p][ux] + fire);
+                    fire = fire - step;
+                } else {
+                    double r = get_noise(e + 200 * p, 1.0, 1.0);
+                    if (r > reception || delta < shift) {
+                        fire = r * (256 - dst[p][cx]);
+                        step = (256 - dst[p][cx]) / 32;
+                        fx = cx - 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
 void f0r_update(f0r_instance_t instance, double time,
                 const uint32_t *in_frame, uint32_t *out_frame)
 {
@@ -256,17 +349,20 @@ void f0r_update(f0r_instance_t instance, double time,
     gavl_video_convert(inst->rgba_to_ycbcr, inst->frame_in, inst->frame_ycbcr);
     
     double reception = inst->reception * 0.04 + 0.96;
-    double shift = 1.0 - inst->shift * 0.8;
-    double noise = inst->noise;
+    double shift = inst->shift * 0.8;
+    double noise = inst->noise * 0.48;
     
     // create map
     gavl_video_scaler_scale(inst->map_scaler,
                             inst->frame_ycbcr, inst->frame_map);
 
-    burn(reception, shift, noise, time, inst->frame_ycbcr->planes[1],
-         inst->cwidth, inst->cheight, inst->frame_map->planes[0]);
-    burn(reception, shift, noise, time, inst->frame_ycbcr->planes[2],
-         inst->cwidth, inst->cheight, inst->frame_map->planes[0]);
+    burn2(
+        inst->cwidth, inst->cheight,
+        inst->frame_ycbcr->planes[1],
+        inst->frame_ycbcr->planes[2],
+        inst->width, inst->frame_ycbcr->planes[0],
+        time,
+        reception, shift, noise);
     
     inst->frame_out->planes[0] = (uint8_t *)out_frame;
     gavl_video_convert(inst->ycbcr_to_rgba, inst->frame_ycbcr, inst->frame_out);
@@ -275,9 +371,18 @@ void f0r_update(f0r_instance_t instance, double time,
 // -----------------------------------------------------------------------------
 // SECAM FIRE
 
-void burn(double reception, double shift, double noise, double time,
-          uint8_t *out, int cwidth, int cheight, const uint8_t *map)
-{
+#if 0
+void burn(
+    double reception,
+    double shift,
+    double noise,
+    double time,
+    uint8_t *out,
+    uint8_t *neighbour,
+    int cwidth,
+    int cheight,
+    const uint8_t *map
+) {
     int fire = -1;
     int step = 0;
 
@@ -302,6 +407,7 @@ void burn(double reception, double shift, double noise, double time,
 
         for (int cx = 0; cx < cwidth; cx++) {
             double delta = 0.0;
+            double trec = reception;
 
             if (noise) {
                 double n = get_noise(time + cy * cwidth + cx, 36.0, 0.48) - 18.0;
@@ -310,12 +416,23 @@ void burn(double reception, double shift, double noise, double time,
             }
 
             if (cx > 0) {
-                int alpha = src_map[cx - 1] * 0.25 + dst_cur[cx] * 0.75;
-                int beta = src_map[cx] * 0.25 + dst_cur[cx + 1] * 0.75;
-                delta = abs(beta - alpha) / 256.0;
+                // int alpha = src_map[cx - 1] * 0.25 + dst_cur[cx] * 0.75;
+                // int beta = src_map[cx] * 0.25 + dst_cur[cx + 1] * 0.75;
+                // delta = abs(beta - alpha) / 256.0;
+
+                int sigma = dst_cur[cx + 1];
+                int tau = neighbour[cy * cwidth + cx + 1];
+
+                if (sigma < 44 && (tau < 44 || tau > 96)) {
+                    delta = 1.0; // 192.0 + abs(sigma - tau) / 64.0;
+                    trec = 0.98;
+                    // dst_cur[cx] = 128;
+                    // dst_low[cx] = 128;
+                    // continue;
+                }
             }
 
-            if (FRAND() > reception || delta > shift) {
+            if (FRAND() > trec || delta > shift) {
                 fire = FRAND() * (256 - dst_cur[cx]);
                 step = (256 - dst_cur[cx]) / 32;
     
@@ -344,3 +461,4 @@ void burn(double reception, double shift, double noise, double time,
         }
     }
 }
+#endif
