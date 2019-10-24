@@ -5,12 +5,12 @@
 #include <memory.h>
 #include <frei0r.h>
 #include <gavl/gavl.h>
+#include "pcg-c-basic/pcg_basic.h"
 
 // -----------------------------------------------------------------------------
 // BASICS
 
 #define COLOR_CLAMP(x) ((x) < 0 ? 0 : ((x) > 255 ? 255 : (x)))
-#define FRAND() (rand() / (double)RAND_MAX)
 
 typedef struct secamiz0r_instance_s {
     unsigned int width;
@@ -36,26 +36,33 @@ typedef struct secamiz0r_instance_s {
     // I think it's obvious.
     gavl_video_converter_t *rgba_to_ycbcr;
     gavl_video_converter_t *ycbcr_to_rgba;
+
+    pcg32_random_t rng;
+
+    double probability;
+    double threshold;
+    double noise_amplitude;
 } secamiz0r_instance_t;
 
 // -----------------------------------------------------------------------------
 // 1D NOISE GENERATOR
 
-#define MAX_NOISE_VERTICES 262144
+#define MAX_NOISE_VERTICES 4096
 #define MAX_NOISE_VERTICES_MASK (MAX_NOISE_VERTICES - 1)
 
 double *noise_vertices;
 
 static int noise_init() {
+    pcg32_random_t rng;
+
     noise_vertices = malloc(sizeof(double) * MAX_NOISE_VERTICES);
     if (!noise_vertices) {
         return 0;
     }
 
-    // FIXME: I should use better RNG
-    srand(time(NULL));
+    pcg32_srandom_r(&rng, 213u, 1996u);
     for (int i = 0; i < MAX_NOISE_VERTICES; i++) {
-        noise_vertices[i] = FRAND();
+        noise_vertices[i] = ldexp(pcg32_random_r(&rng), -32);
     }
 
     return 1;
@@ -127,7 +134,7 @@ f0r_instance_t f0r_construct(unsigned int width, unsigned int height) {
 
     inst->reception = 0.95;
     inst->shift = 0.30;
-    inst->noise = 0.36;
+    inst->noise = 0.24;
     
     gavl_video_format_t *rgba = &inst->format_rgba;
     rgba->frame_width = rgba->image_width = inst->width;
@@ -168,6 +175,8 @@ f0r_instance_t f0r_construct(unsigned int width, unsigned int height) {
 
     gavl_video_converter_init(inst->rgba_to_ycbcr, rgba, ycbcr);
     gavl_video_converter_init(inst->ycbcr_to_rgba, ycbcr, rgba);
+
+    pcg32_srandom_r(&inst->rng, 0xdead, 0xcafe);
 
     return (f0r_instance_t)inst;
 }
@@ -222,14 +231,17 @@ void f0r_get_param_value(f0r_instance_t instance,
     }
 }
 
-void secam_fire(
-    int cwidth, int cheight, uint8_t *cb, uint8_t *cr,
-    int width, const uint8_t *luma,
-    double time,
-    double reception, double shift, double noise
-) {
-    for (int cy = 0; cy < cheight - 1; cy++) {
-        // Work only on even lines
+void secam_fire(secamiz0r_instance_t *inst, double time) {
+    // uint8_t *luma = inst->frame_ycbcr->planes[0];
+    uint8_t *cb = inst->frame_ycbcr->planes[1];
+    uint8_t *cr = inst->frame_ycbcr->planes[2];
+
+    double threshold = 1.0 - inst->shift;
+    double probability = inst->reception * 0.01 + 0.99;
+
+    for (int cy = 0; cy < inst->cheight - 1; cy++) {
+        // Work only on even lines.
+        // Because of this we have to alter two pixels at the same time.
         if (cy % 2 == 1) {
             continue;
         }
@@ -238,66 +250,101 @@ void secam_fire(
         int step = 0;
 
         uint8_t *dst[2];
-        dst[0] = &cb[cy * cwidth];
-        dst[1] = &cr[cy * cwidth];
+        dst[0] = &cb[cy * inst->cwidth];
+        dst[1] = &cr[cy * inst->cwidth];
 
+        // We're altering two planes, a blue and a red.
         for (int p = 0; p < 2; p++) {
             int fx = 0;
 
-            for (int cx = 0; cx < cwidth; cx++) {
-                int e = time * 20.0 + cy * cwidth + cx;
-                int ux = cx + cwidth;
+            unsigned int frame_rand = pcg32_random_r(&inst->rng);
 
-                if (noise) {
-                    double n = get_noise(e, 36.0, noise) - 18.0;
+            for (int cx = 0; cx < inst->cwidth; cx++) {
+                int ux = cx + inst->cwidth;
+
+                //
+                // Step 1: add some static chroma noise
+                if (inst->noise) {
+                    double amp;
+                    double n;
+                    int e;
+
+                    // noise increases chroma signal from 12 to 60
+                    amp = inst->noise * 48.0 + 12.0;
+                    e = frame_rand + cy * inst->cwidth + cx;
+                    n = get_noise(e, amp, 0.18);
+
                     dst[p][cx] = COLOR_CLAMP(dst[p][cx] + n);
                     dst[p][ux] = COLOR_CLAMP(dst[p][ux] + n);
                 }
 
+                //
+                // Step 2: Calculate delta value, which is used to create
+                // a fire if there are sharp edges.
+                //
+                // Note: temporarily removed because SECAM doesn't work
+                // this way, I guess.
+#if 0
                 double delta = 0.0;
-                if (shift > 0.0 && cx >= 4 && cx <= cwidth - 16) {
-                    int y = cy * 2;
-
-                    int x, p, q, s, t;
+                if (threshold < 1.0 && cx < inst->cwidth - 1) {
+                    int x, y, a, b, c, d;
                     double sigma, tau;
 
-                    x = cx * 2 + 4;
-                    p = luma[y * width + x];
-                    q = luma[y * width + x + 1];
-                    s = luma[y * width + x + width];
-                    t = luma[y * width + x + width + 1];
-                    sigma = (p + q + s + t) / 256.0;
+                    x = cx * 2;
+                    y = cy * 2;
+                    a = luma[y * inst->width + x];
+                    b = luma[y * inst->width + x + 1];
+                    c = luma[y * inst->width + x + inst->width];
+                    d = luma[y * inst->width + x + inst->width + 1];
+                    sigma = (a + b + c + d) / 256.0;
 
-                    x = cx * 2 + 6;
-                    p = luma[y * width + x];
-                    q = luma[y * width + x + 1];
-                    s = luma[y * width + x + width];
-                    t = luma[y * width + x + width + 1];
-                    tau = (p + q + s + t) / 256.0;
+                    x = x + 2;
+                    a = luma[y * inst->width + x];
+                    b = luma[y * inst->width + x + 1];
+                    c = luma[y * inst->width + x + inst->width];
+                    d = luma[y * inst->width + x + inst->width + 1];
+                    tau = (a + b + c + d) / 256.0;
 
-                    delta = 1.0 - abs(sigma - tau) / 256.0;
+                    delta = fabs(sigma - tau) / 256.0;
                 }
+#endif
 
+                //
+                // Step 3a: Keep painting a pending fire if it's there
                 if (fire >= 16) {
                     int dx = cx - fx;
 
-                    // tail
+                    // If we are not too far from the starting point,
+                    // we have to draw a "slight tail" in order to
+                    // keep a fire more slight.
                     if (dx < 6) {
-                        dst[p][cx] = COLOR_CLAMP(dst[p][cx] + 0.15 * dx * fire);
-                        dst[p][ux] = COLOR_CLAMP(dst[p][ux] + 0.15 * dx * fire);
+                        dst[p][cx] = COLOR_CLAMP(
+                            dst[p][cx] + 0.15 * dx * fire
+                        );
+                        dst[p][ux] = COLOR_CLAMP(
+                            dst[p][ux] + 0.15 * dx * fire
+                        );
                         continue;
                     }
 
                     dst[p][cx] = COLOR_CLAMP(dst[p][cx] + fire);
                     dst[p][ux] = COLOR_CLAMP(dst[p][ux] + fire);
+
                     fire = fire - step;
-                } else {
-                    double r = get_noise(e + 200 * p, 1.0, 1.0);
-                    if (r > reception || delta < shift) {
-                        fire = r * (256 - dst[p][cx]);
-                        step = (256 - dst[p][cx]) / 32;
-                        fx = cx - 1;
+                    continue;
+                }
+
+                //
+                // Step 3b: Create a fire if there is need to do it
+                double r = ldexp(pcg32_random_r(&inst->rng), -32);
+                double delta = abs(dst[0][cx] - dst[1][cx]) / 256.0;
+                if (r > probability || delta > threshold) {
+                    fire = r * (256 - dst[p][cx]);
+                    step = (256 - dst[p][cx]) / 32;
+                    if (step < 4) {
+                        step = 4;
                     }
+                    fx = cx;
                 }
             }
         }
@@ -311,18 +358,7 @@ void f0r_update(f0r_instance_t instance, double time,
 
     inst->frame_in->planes[0] = (uint8_t *)in_frame;
     gavl_video_convert(inst->rgba_to_ycbcr, inst->frame_in, inst->frame_ycbcr);
-    
-    double reception = inst->reception * 0.04 + 0.96;
-    double shift = inst->shift * 0.8;
-    double noise = inst->noise * 0.48;
-
-    secam_fire(
-        inst->cwidth, inst->cheight,
-        inst->frame_ycbcr->planes[1],
-        inst->frame_ycbcr->planes[2],
-        inst->width, inst->frame_ycbcr->planes[0],
-        time,
-        reception, shift, noise);
+    secam_fire(inst, time);
     
     inst->frame_out->planes[0] = (uint8_t *)out_frame;
     gavl_video_convert(inst->ycbcr_to_rgba, inst->frame_ycbcr, inst->frame_out);
