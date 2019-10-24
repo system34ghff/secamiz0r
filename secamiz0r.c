@@ -32,32 +32,11 @@ typedef struct secamiz0r_instance_s {
     // This is the Y'CbCr frame we are working on.
     gavl_video_frame_t *frame_ycbcr;
     gavl_video_format_t format_ycbcr;
-
-    // We also need a downscaled copy of the Y'CbCr frame
-    // for some kind of `edge detect'.
-    // This is how I solve problems.
-    gavl_video_scaler_t *map_scaler;
-    gavl_video_format_t format_map;
-    gavl_video_frame_t *frame_map;
     
     // I think it's obvious.
     gavl_video_converter_t *rgba_to_ycbcr;
     gavl_video_converter_t *ycbcr_to_rgba;
 } secamiz0r_instance_t;
-
-#if 0
-void burn(
-    double reception,
-    double shift,
-    double noise,
-    double time,
-    uint8_t *out,
-    uint8_t *neighbour,
-    int cwidth,
-    int cheight,
-    const uint8_t *map
-);
-#endif
 
 // -----------------------------------------------------------------------------
 // 1D NOISE GENERATOR
@@ -172,14 +151,6 @@ f0r_instance_t f0r_construct(unsigned int width, unsigned int height) {
     inst->frame_ycbcr = gavl_video_frame_create(ycbcr);
     inst->cwidth = inst->frame_ycbcr->strides[1];
     inst->cheight = inst->height / 2;
-
-    gavl_video_format_t *map = &inst->format_map;
-    map->frame_width = map->image_width = inst->width / 2;
-    map->frame_height = map->image_height = inst->height / 2;
-    map->pixel_width = map->pixel_height = 1;
-    map->pixelformat = GAVL_YUV_420_P;
-    
-    inst->frame_map = gavl_video_frame_create(map);
     
     gavl_video_options_t *options;
 
@@ -198,18 +169,12 @@ f0r_instance_t f0r_construct(unsigned int width, unsigned int height) {
     gavl_video_converter_init(inst->rgba_to_ycbcr, rgba, ycbcr);
     gavl_video_converter_init(inst->ycbcr_to_rgba, ycbcr, rgba);
 
-    inst->map_scaler = gavl_video_scaler_create();
-    options = gavl_video_scaler_get_options(inst->map_scaler);
-    gavl_video_options_set_quality(options, GAVL_QUALITY_FASTEST);
-    gavl_video_scaler_init(inst->map_scaler, ycbcr, map);
-
     return (f0r_instance_t)inst;
 }
 
 void f0r_destruct(f0r_instance_t instance) {
     secamiz0r_instance_t* inst = (secamiz0r_instance_t*)instance;
-    
-    gavl_video_scaler_destroy(inst->map_scaler);
+
     gavl_video_converter_destroy(inst->ycbcr_to_rgba);
     gavl_video_converter_destroy(inst->rgba_to_ycbcr);
     
@@ -219,7 +184,6 @@ void f0r_destruct(f0r_instance_t instance) {
     gavl_video_frame_destroy(inst->frame_in);
     gavl_video_frame_destroy(inst->frame_out);
     gavl_video_frame_destroy(inst->frame_ycbcr);
-    gavl_video_frame_destroy(inst->frame_map);
     
     free(instance);
 }
@@ -258,7 +222,7 @@ void f0r_get_param_value(f0r_instance_t instance,
     }
 }
 
-void burn2(
+void secam_fire(
     int cwidth, int cheight, uint8_t *cb, uint8_t *cr,
     int width, const uint8_t *luma,
     double time,
@@ -351,12 +315,8 @@ void f0r_update(f0r_instance_t instance, double time,
     double reception = inst->reception * 0.04 + 0.96;
     double shift = inst->shift * 0.8;
     double noise = inst->noise * 0.48;
-    
-    // create map
-    gavl_video_scaler_scale(inst->map_scaler,
-                            inst->frame_ycbcr, inst->frame_map);
 
-    burn2(
+    secam_fire(
         inst->cwidth, inst->cheight,
         inst->frame_ycbcr->planes[1],
         inst->frame_ycbcr->planes[2],
@@ -367,98 +327,3 @@ void f0r_update(f0r_instance_t instance, double time,
     inst->frame_out->planes[0] = (uint8_t *)out_frame;
     gavl_video_convert(inst->ycbcr_to_rgba, inst->frame_ycbcr, inst->frame_out);
 }
-
-// -----------------------------------------------------------------------------
-// SECAM FIRE
-
-#if 0
-void burn(
-    double reception,
-    double shift,
-    double noise,
-    double time,
-    uint8_t *out,
-    uint8_t *neighbour,
-    int cwidth,
-    int cheight,
-    const uint8_t *map
-) {
-    int fire = -1;
-    int step = 0;
-
-    for (int cy = 0; cy < cheight - 1; cy++) {
-        // Work only on even lines
-        if (cy % 2 == 1) {
-            continue;
-        }
-
-        // Current and lower scanlines
-        uint8_t *dst_cur = &out[cy * cwidth];
-        uint8_t *dst_low = dst_cur + cwidth;
-
-        // Map's scanline
-        const uint8_t *src_map = &map[cy * cwidth];
-
-        // Initially this value was starting at 0, but this could make
-        // beginning of a scanline look empty, so I decided to go with -8.
-        // `fx' stands for `fire index', this is the X value where the last
-        // fire was flashed.
-        int fx = -8;
-
-        for (int cx = 0; cx < cwidth; cx++) {
-            double delta = 0.0;
-            double trec = reception;
-
-            if (noise) {
-                double n = get_noise(time + cy * cwidth + cx, 36.0, 0.48) - 18.0;
-                dst_cur[cx] = COLOR_CLAMP(dst_cur[cx] + n);
-                dst_low[cx] = COLOR_CLAMP(dst_low[cx] + n);
-            }
-
-            if (cx > 0) {
-                // int alpha = src_map[cx - 1] * 0.25 + dst_cur[cx] * 0.75;
-                // int beta = src_map[cx] * 0.25 + dst_cur[cx + 1] * 0.75;
-                // delta = abs(beta - alpha) / 256.0;
-
-                int sigma = dst_cur[cx + 1];
-                int tau = neighbour[cy * cwidth + cx + 1];
-
-                if (sigma < 44 && (tau < 44 || tau > 96)) {
-                    delta = 1.0; // 192.0 + abs(sigma - tau) / 64.0;
-                    trec = 0.98;
-                    // dst_cur[cx] = 128;
-                    // dst_low[cx] = 128;
-                    // continue;
-                }
-            }
-
-            if (FRAND() > trec || delta > shift) {
-                fire = FRAND() * (256 - dst_cur[cx]);
-                step = (256 - dst_cur[cx]) / 32;
-    
-                if (delta > shift) {
-                    // no tail if the fire was caused by `channel shift'
-                    fx = -8;
-                } else {
-                    fx = cx - 1;
-                }
-            }
-
-            // tail
-            if (cx - fx < 6) {
-                dst_cur[cx] = COLOR_CLAMP(dst_cur[cx] + fire * (0.15 * (cx - fx)));
-                dst_low[cx] = COLOR_CLAMP(dst_low[cx] + fire * (0.15 * (cx - fx)));
-                continue;
-            }
-
-            if (fire <= 0) {
-                continue;
-            }
-
-            dst_cur[cx] = COLOR_CLAMP(dst_cur[cx] + fire);
-            dst_low[cx] = COLOR_CLAMP(dst_low[cx] + fire);
-            fire -= step;
-        }
-    }
-}
-#endif
