@@ -271,8 +271,8 @@ void secam_fire(secamiz0r_instance_t *inst, double time) {
                     double n;
                     int e;
 
-                    // noise increases chroma signal from 12 to 60
-                    amp = inst->noise * 48.0 + 12.0;
+                    // noise increases chroma signal up to 60
+                    amp = inst->noise * 60.0;
                     e = frame_rand + cy * inst->cwidth + cx;
                     n = get_noise(e, amp, 0.18);
 
