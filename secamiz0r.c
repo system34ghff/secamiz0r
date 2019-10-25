@@ -12,6 +12,8 @@
 
 #define COLOR_CLAMP(x) ((x) < 0 ? 0 : ((x) > 255 ? 255 : (x)))
 
+#define SECAM_FIRE_INTENSITY 192
+
 typedef struct secamiz0r_instance_s {
     unsigned int width;
     unsigned int height;
@@ -339,8 +341,9 @@ void secam_fire(secamiz0r_instance_t *inst, double time) {
                 double r = ldexp(pcg32_random_r(&inst->rng), -32);
                 double delta = abs(dst[0][cx] - dst[1][cx]) / 256.0;
                 if (r > probability || delta > threshold) {
-                    fire = r * (256 - dst[p][cx]);
-                    step = (256 - dst[p][cx]) / 32;
+                    int c = SECAM_FIRE_INTENSITY - dst[p][cx];
+                    fire = r * c;
+                    step = c / (SECAM_FIRE_INTENSITY / 8);
                     if (step < 4) {
                         step = 4;
                     }
