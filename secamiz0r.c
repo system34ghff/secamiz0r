@@ -239,7 +239,7 @@ void secam_fire(secamiz0r_instance_t *inst, double time) {
     uint8_t *cr = inst->frame_ycbcr->planes[2];
 
     double threshold = 1.0 - inst->shift;
-    double probability = inst->reception * 0.01 + 0.99;
+    double probability = inst->reception * 0.001 + 0.999;
 
     for (int cy = 0; cy < inst->cheight - 1; cy++) {
         // Work only on even lines.
