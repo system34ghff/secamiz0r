@@ -46,6 +46,8 @@ typedef struct secamiz0r_instance_s {
     double noise_amplitude;
 } secamiz0r_instance_t;
 
+void secam_fire(secamiz0r_instance_t *inst, double time);
+
 // -----------------------------------------------------------------------------
 // 1D NOISE GENERATOR
 
@@ -233,6 +235,22 @@ void f0r_get_param_value(f0r_instance_t instance,
     }
 }
 
+void f0r_update(f0r_instance_t instance, double time,
+                const uint32_t *in_frame, uint32_t *out_frame)
+{
+    secamiz0r_instance_t *inst = (secamiz0r_instance_t *)instance;
+
+    inst->frame_in->planes[0] = (uint8_t *)in_frame;
+    gavl_video_convert(inst->rgba_to_ycbcr, inst->frame_in, inst->frame_ycbcr);
+    secam_fire(inst, time);
+    
+    inst->frame_out->planes[0] = (uint8_t *)out_frame;
+    gavl_video_convert(inst->ycbcr_to_rgba, inst->frame_ycbcr, inst->frame_out);
+}
+
+// -----------------------------------------------------------------------------
+// SECAM FIRE
+
 void secam_fire(secamiz0r_instance_t *inst, double time) {
     // uint8_t *luma = inst->frame_ycbcr->planes[0];
     uint8_t *cb = inst->frame_ycbcr->planes[1];
@@ -354,15 +372,3 @@ void secam_fire(secamiz0r_instance_t *inst, double time) {
     }
 }
 
-void f0r_update(f0r_instance_t instance, double time,
-                const uint32_t *in_frame, uint32_t *out_frame)
-{
-    secamiz0r_instance_t *inst = (secamiz0r_instance_t *)instance;
-
-    inst->frame_in->planes[0] = (uint8_t *)in_frame;
-    gavl_video_convert(inst->rgba_to_ycbcr, inst->frame_in, inst->frame_ycbcr);
-    secam_fire(inst, time);
-    
-    inst->frame_out->planes[0] = (uint8_t *)out_frame;
-    gavl_video_convert(inst->ycbcr_to_rgba, inst->frame_ycbcr, inst->frame_out);
-}
