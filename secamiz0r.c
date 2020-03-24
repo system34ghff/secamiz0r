@@ -3,6 +3,7 @@
 #include <time.h>
 #include <math.h>
 #include <memory.h>
+#include <stdbool.h>
 #include <frei0r.h>
 #include <gavl/gavl.h>
 #include "pcg-c-basic/pcg_basic.h"
@@ -25,6 +26,8 @@ typedef struct secamiz0r_instance_s {
     double reception; /* how much random fires will be emitted */
     double shift; /* threshold of fires that will be emitted on horizontal edges */
     double noise; /* controls amount of chroma noise, screws quality of picture */
+
+    bool cross_int;
 
     // Input and output frames are in RGBA format.
     gavl_video_format_t format_rgba;
@@ -107,25 +110,30 @@ void f0r_get_plugin_info(f0r_plugin_info_t *info) {
     info->frei0r_version = FREI0R_MAJOR_VERSION;
     info->major_version = 0;
     info->minor_version = 8;
-    info->num_params = 3;
+    info->num_params = 4;
     info->explanation = "Adds so called \"SECAM fire\" to the image.";
 }
 
 void f0r_get_param_info(f0r_param_info_t* info, int param_index) {
     switch (param_index) {
     case 0:
-        info->name = "reception";
+        info->name = "Reception";
         info->type = F0R_PARAM_DOUBLE;
         info->explanation = NULL;
         break;
     case 1:
-        info->name = "shift";
+        info->name = "Channel Shift";
         info->type = F0R_PARAM_DOUBLE;
         info->explanation = NULL;
         break;
     case 2:
-        info->name = "noise";
+        info->name = "Chroma Noise";
         info->type = F0R_PARAM_DOUBLE;
+        info->explanation = NULL;
+        break;
+    case 3:
+        info->name = "Luma-chroma interference";
+        info->type = F0R_PARAM_BOOL;
         info->explanation = NULL;
         break;
     }
@@ -215,6 +223,9 @@ void f0r_set_param_value(f0r_instance_t instance,
     case 2:
         inst->noise = *((double *)param);
         break;
+    case 3:
+        inst->cross_int = *((double *)param) >= 0.5;
+        break;
     }
 }
 
@@ -231,6 +242,9 @@ void f0r_get_param_value(f0r_instance_t instance,
         break;
     case 2:
         *((double *)param) = inst->noise;
+        break;
+    case 3:
+        *((double *)param) = inst->cross_int ? 1.0 : 0.0;
         break;
     }
 }
@@ -252,7 +266,7 @@ void f0r_update(f0r_instance_t instance, double time,
 // SECAM FIRE
 
 void secam_fire(secamiz0r_instance_t *inst, double time) {
-    // uint8_t *luma = inst->frame_ycbcr->planes[0];
+    uint8_t *luma = inst->frame_ycbcr->planes[0];
     uint8_t *cb = inst->frame_ycbcr->planes[1];
     uint8_t *cr = inst->frame_ycbcr->planes[2];
 
@@ -301,33 +315,32 @@ void secam_fire(secamiz0r_instance_t *inst, double time) {
                 //
                 // Step 2: Calculate delta value, which is used to create
                 // a fire if there are sharp edges.
-                //
-                // Note: temporarily removed because SECAM doesn't work
-                // this way, I guess.
-#if 0
-                double delta = 0.0;
-                if (threshold < 1.0 && cx < inst->cwidth - 1) {
-                    int x, y, a, b, c, d;
-                    double sigma, tau;
+                double luma_delta = 0.0;
+                if (inst->cross_int && cx < inst->cwidth - 1) {
+                    int x, y, w;
+                    int a, a_00, a_01, a_10, a_11;
+                    int b, b_00, b_01, b_10, b_11;
 
                     x = cx * 2;
                     y = cy * 2;
-                    a = luma[y * inst->width + x];
-                    b = luma[y * inst->width + x + 1];
-                    c = luma[y * inst->width + x + inst->width];
-                    d = luma[y * inst->width + x + inst->width + 1];
-                    sigma = (a + b + c + d) / 256.0;
+                    w = inst->cwidth * 2;
+
+                    a_00 = luma[y * w + x];
+                    a_01 = luma[y * w + x + 1];
+                    a_10 = luma[y * w + x + w];
+                    a_11 = luma[y * w + x + w + 1];
+                    a = a_00 + a_01 + a_10 + a_11;
 
                     x = x + 2;
-                    a = luma[y * inst->width + x];
-                    b = luma[y * inst->width + x + 1];
-                    c = luma[y * inst->width + x + inst->width];
-                    d = luma[y * inst->width + x + inst->width + 1];
-                    tau = (a + b + c + d) / 256.0;
 
-                    delta = fabs(sigma - tau) / 256.0;
+                    b_00 = luma[y * w + x];
+                    b_01 = luma[y * w + x + 1];
+                    b_10 = luma[y * w + x + w];
+                    b_11 = luma[y * w + x + w + 1];
+                    b = b_00 + b_01 + b_10 + b_11;
+
+                    luma_delta = (abs(b - a) / 256.0) * 0.4 + 0.3;
                 }
-#endif
 
                 //
                 // Step 3a: Keep painting a pending fire if it's there
@@ -358,7 +371,7 @@ void secam_fire(secamiz0r_instance_t *inst, double time) {
                 // Step 3b: Create a fire if there is need to do it
                 double r = ldexp(pcg32_random_r(&inst->rng), -32);
                 double delta = abs(dst[0][cx] - dst[1][cx]) / 256.0;
-                if (r > probability || delta > threshold) {
+                if (r > probability || (delta + luma_delta) > threshold) {
                     int c = SECAM_FIRE_INTENSITY - dst[p][cx];
                     fire = r * c;
                     step = c / (SECAM_FIRE_INTENSITY / 8);
